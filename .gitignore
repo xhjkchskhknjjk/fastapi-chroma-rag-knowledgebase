@@ -1,8 +1,22 @@
-venv/
-__pycache__/
-*.log
-*.pdf
-.DS_Store
-.idea/
-.vscode/
+# 密钥环境变量
 .env
+
+# 上传的PDF文件
+uploads/
+
+# chroma向量数据库文件夹
+chroma_db/
+
+# python缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 虚拟环境
+venv/
+
+# 日志
+*.log
+
+# docker临时
+.dockerignore
