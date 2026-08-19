@@ -20,3 +20,5 @@ venv/
 
 # docker临时
 .dockerignore
+
+meta.json
