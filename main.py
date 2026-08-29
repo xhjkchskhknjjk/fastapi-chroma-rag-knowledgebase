@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 import os
 import requests
 from dotenv import load_dotenv
+from fastapi import Request
 
 # 导入自己写的工具
 from utils import process_pdf_to_vector, search_vector_db, get_history, append_history
@@ -12,6 +13,18 @@ load_dotenv()
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 print(f"==== DEEPSEEK_API_KEY:[{DEEPSEEK_API_KEY}]")
 app = FastAPI(title="RAG知识库服务")
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={
+            "code": 500,
+            "msg": f"服务异常：{str(exc)}",
+            "data": None
+        }
+    )
+
 
 UPLOAD_DIR = "./uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
