@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 from fastapi import Request
 
 # 导入自己写的工具
-from utils import process_pdf_to_vector, search_vector_db, get_history, append_history
+from utils import process_pdf_to_vector, search_vector_db, get_history, append_history, is_pdf_already_exist, get_uploaded_doc_list, delete_document_by_unique_id
 
 load_dotenv()
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
@@ -58,6 +58,10 @@ def call_llm(prompt: str):
 # 上传PDF接口
 @app.post("/upload")
 async def upload_pdf(file: UploadFile = File(...)):
+    # 上传PDF接口内部
+    filename = file.filename
+    if is_pdf_already_exist(filename):
+        return JSONResponse(status_code=200, content={"code":0,"msg":"该PDF已经上传过，无需重复导入"})
     try:
         save_path = os.path.join(UPLOAD_DIR, file.filename)
         with open(save_path, "wb") as f:
@@ -97,6 +101,16 @@ async def chat(req: ChatRequest):
         }
     except Exception as e:
         return JSONResponse(status_code=500, content={"code":500,"msg":"问答失败","error":str(e)})
+
+@app.get("/doc/list", summary="获取已上传文档列表")
+def list_docs():
+    docs = get_uploaded_doc_list()
+    return {"code":0, "msg":"ok", "data":docs}
+
+@app.delete("/doc/{doc_unique_id}", summary="删除指定文档以及对应向量")
+def del_doc(doc_unique_id: str):
+    cnt = delete_document_by_unique_id(doc_unique_id)
+    return {"code":0, "msg":f"已删除 {cnt} 条向量切片"}
 
 
 if __name__ == "__main__":
