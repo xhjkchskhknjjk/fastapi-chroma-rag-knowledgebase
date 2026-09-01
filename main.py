@@ -1,21 +1,36 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import os
 import requests
 from dotenv import load_dotenv
-from fastapi import Request
-
 # 导入自己写的工具
 from utils import process_pdf_to_vector, search_vector_db, get_history, append_history, is_pdf_already_exist, get_uploaded_doc_list, delete_document_by_unique_id
+from logger import logger
+import time
 
+# 加载环境变量
 load_dotenv()
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 print(f"==== DEEPSEEK_API_KEY:[{DEEPSEEK_API_KEY}]")
+
+# 【关键】先实例化app对象
 app = FastAPI(title="RAG知识库服务")
 
+# 再注册中间件
+@app.middleware("http")
+async def log_request_middleware(request: Request, call_next):
+    start_time = time.time()
+    logger.info(f"收到请求: method={request.method}, path={request.url.path}")
+    response = await call_next(request)
+    cost_ms = round((time.time() - start_time)*1000,2)
+    logger.info(f"请求完成: path={request.url.path}, status={response.status_code}, cost={cost_ms}ms")
+    return response
+
+# 全局异常处理器，增加日志落盘
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"全局捕获异常: {str(exc)}", exc_info=True)
     return JSONResponse(
         status_code=500,
         content={
@@ -24,7 +39,6 @@ async def global_exception_handler(request: Request, exc: Exception):
             "data": None
         }
     )
-
 
 UPLOAD_DIR = "./uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -36,9 +50,7 @@ class ChatRequest(BaseModel):
     session_id: str = Field(default="default", description="会话ID区分不同用户")
 
 # Deepseek配置
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
-
 def call_llm(prompt: str):
     """调用大模型API，封装在main，属于接口业务逻辑"""
     headers = {
@@ -54,42 +66,41 @@ def call_llm(prompt: str):
     res_json = resp.json()
     return res_json["choices"][0]["message"]["content"]
 
-
 # 上传PDF接口
 @app.post("/upload")
 async def upload_pdf(file: UploadFile = File(...)):
-    # 上传PDF接口内部
     filename = file.filename
     if is_pdf_already_exist(filename):
+        logger.info(f"重复上传PDF：{filename}")
         return JSONResponse(status_code=200, content={"code":0,"msg":"该PDF已经上传过，无需重复导入"})
     try:
         save_path = os.path.join(UPLOAD_DIR, file.filename)
         with open(save_path, "wb") as f:
             f.write(await file.read())
-        # 调用工具函数处理入库
+        logger.info(f"开始处理PDF入库：{filename}")
         process_pdf_to_vector(save_path)
+        logger.info(f"PDF入库完成：{filename}")
         return {"code":0, "msg":"上传并入库成功", "filename":file.filename}
     except Exception as e:
+        logger.error(f"PDF处理失败：{filename}", exc_info=True)
         return JSONResponse(status_code=500, content={"code":500,"msg":"PDF处理失败","error":str(e)})
-
 
 # 带记忆问答接口
 @app.post("/qa/chat")
 async def chat(req: ChatRequest):
     try:
+        logger.info(f"问答请求，session_id={req.session_id}, query={req.query}")
         history = get_history(req.session_id)
         docs = search_vector_db(req.query, k=req.k)
         context_text = "\n".join([d.page_content for d in docs])
-
         # 拼接prompt：历史对话 + 参考文档 + 当前问题
         prompt = ""
         for item in history:
             prompt += f"用户：{item['user']}\n助手：{item['assistant']}\n"
         prompt += f"参考文档：{context_text}\n请严格基于参考文档回答用户问题：{req.query}"
-
         answer = call_llm(prompt)
         append_history(req.session_id, req.query, answer)
-
+        logger.info(f"问答完成，session_id={req.session_id}")
         return {
             "code":0,
             "msg":"ok",
@@ -100,18 +111,20 @@ async def chat(req: ChatRequest):
             }
         }
     except Exception as e:
+        logger.error(f"问答接口异常 session={req.session_id}", exc_info=True)
         return JSONResponse(status_code=500, content={"code":500,"msg":"问答失败","error":str(e)})
 
 @app.get("/doc/list", summary="获取已上传文档列表")
 def list_docs():
     docs = get_uploaded_doc_list()
+    logger.info(f"查询文档列表，共{len(docs)}条文档")
     return {"code":0, "msg":"ok", "data":docs}
 
 @app.delete("/doc/{doc_unique_id}", summary="删除指定文档以及对应向量")
 def del_doc(doc_unique_id: str):
     cnt = delete_document_by_unique_id(doc_unique_id)
+    logger.info(f"删除文档 doc_unique_id={doc_unique_id}, 删除向量切片数量={cnt}")
     return {"code":0, "msg":f"已删除 {cnt} 条向量切片"}
-
 
 if __name__ == "__main__":
     import uvicorn

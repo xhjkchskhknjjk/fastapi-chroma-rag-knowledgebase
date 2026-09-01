@@ -16,8 +16,12 @@ COPY . .
 # 创建上传文件目录
 RUN mkdir -p /app/uploads
 
+RUN mkdir -p /app/logs
+
 # 容器对外暴露端口8000（和代码uvicorn端口保持一致）
 EXPOSE 8000
 
 # 容器启动命令
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+
