@@ -1,13 +1,19 @@
-from fastapi import FastAPI, UploadFile, File, Request
+from fastapi import FastAPI, UploadFile, File, Request, Depends
 from fastapi.responses import JSONResponse
+from fastapi.openapi.models import APIKey
+from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel, Field
 import os
 import requests
 from dotenv import load_dotenv
-# 导入自己写的工具
+
 from utils import process_pdf_to_vector, search_vector_db, get_history, append_history, is_pdf_already_exist, get_uploaded_doc_list, delete_document_by_unique_id
 from logger import logger
+# 这里补上 _rate_limit_exceeded_handler
+from security import limiter, RATE_LIMIT, verify_token, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 import time
+
 
 # 加载环境变量
 load_dotenv()
@@ -16,6 +22,48 @@ print(f"==== DEEPSEEK_API_KEY:[{DEEPSEEK_API_KEY}]")
 
 # 【关键】先实例化app对象
 app = FastAPI(title="RAG知识库服务")
+
+# 注册限流
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# ==========OpenAPI文档增加token输入框（swagger右上角🔐按钮）==========
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    openapi_schema = get_openapi(
+        title="RAG知识库服务",
+        version="1.0.0",
+        description="Day13 增加token鉴权+限流",
+        routes=app.routes,
+    )
+    openapi_schema["components"]["securitySchemes"] = {
+        "ApiKeyAuth": {
+            "type": "apiKey",
+            "in": "header",
+            "name": "X-Access-Token"
+        }
+    }
+    for path in openapi_schema["paths"].values():
+        for method in path.values():
+            method["security"] = [{"ApiKeyAuth": []}]
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+app.openapi = custom_openapi
+
+# 白名单接口：docs/openapi.json跳过token校验
+WHITE_LIST_PATH = {"/docs","/openapi.json"}
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    if request.url.path not in WHITE_LIST_PATH:
+        try:
+            verify_token(request)
+        except HTTPException as e:
+            logger.warning(f"token校验失败 path={request.url.path}")
+            return JSONResponse(status_code=e.status_code, content={"code":e.status_code,"msg":e.detail})
+    return await call_next(request)
 
 # 再注册中间件
 @app.middleware("http")
@@ -68,7 +116,8 @@ def call_llm(prompt: str):
 
 # 上传PDF接口
 @app.post("/upload")
-async def upload_pdf(file: UploadFile = File(...)):
+@limiter.limit(RATE_LIMIT)
+async def upload_pdf(request: Request, file: UploadFile = File(...)):
     filename = file.filename
     if is_pdf_already_exist(filename):
         logger.info(f"重复上传PDF：{filename}")
@@ -87,7 +136,8 @@ async def upload_pdf(file: UploadFile = File(...)):
 
 # 带记忆问答接口
 @app.post("/qa/chat")
-async def chat(req: ChatRequest):
+@limiter.limit(RATE_LIMIT)
+async def chat(request: Request, req: ChatRequest):
     try:
         logger.info(f"问答请求，session_id={req.session_id}, query={req.query}")
         history = get_history(req.session_id)
@@ -115,13 +165,15 @@ async def chat(req: ChatRequest):
         return JSONResponse(status_code=500, content={"code":500,"msg":"问答失败","error":str(e)})
 
 @app.get("/doc/list", summary="获取已上传文档列表")
-def list_docs():
+@limiter.limit(RATE_LIMIT)
+def list_docs(request: Request):
     docs = get_uploaded_doc_list()
     logger.info(f"查询文档列表，共{len(docs)}条文档")
     return {"code":0, "msg":"ok", "data":docs}
 
 @app.delete("/doc/{doc_unique_id}", summary="删除指定文档以及对应向量")
-def del_doc(doc_unique_id: str):
+@limiter.limit(RATE_LIMIT)
+def del_doc(request: Request, doc_unique_id: str):
     cnt = delete_document_by_unique_id(doc_unique_id)
     logger.info(f"删除文档 doc_unique_id={doc_unique_id}, 删除向量切片数量={cnt}")
     return {"code":0, "msg":f"已删除 {cnt} 条向量切片"}
