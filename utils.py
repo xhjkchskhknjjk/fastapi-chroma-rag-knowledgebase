@@ -1,10 +1,17 @@
+import os
+import uuid
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
 
-import os
-import uuid
+# 以当前utils脚本位置为基准，不受启动目录影响
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CHROMA_PERSIST_DIR = os.path.join(BASE_DIR, "chroma_db")
+
+# 自动创建目录
+os.makedirs(CHROMA_PERSIST_DIR, exist_ok=True)
+
 
 # ---------------- 向量库配置 ----------------
 CHROMA_PERSIST_DIR = "./chroma_db"
