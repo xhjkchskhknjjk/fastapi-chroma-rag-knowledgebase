@@ -22,3 +22,6 @@ venv/
 .dockerignore
 
 meta.json
+
+logs/*
+session.db
