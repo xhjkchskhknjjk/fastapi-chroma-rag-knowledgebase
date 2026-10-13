@@ -9,10 +9,39 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 # 以当前utils脚本位置为基准，不受启动目录影响
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CHROMA_PERSIST_DIR = os.path.join(BASE_DIR, "chroma_db")
-SQLITE_DB_PATH = os.path.join(BASE_DIR, "session.db")
+
+# 会话库放在独立的数据目录，不再放在项目根目录。
+# 这一点直接决定了容器能否只挂数据目录：旧版把 session.db 写死在 <项目>/session.db，
+# 想持久化就只能 -v xxx:/app，而那会把镜像里构建好的代码整个遮住。
+DATA_DIR = os.getenv("RAG_DATA_DIR") or os.path.join(BASE_DIR, "data")
+# 会话库完整路径优先，其次由数据目录推导
+SQLITE_DB_PATH = os.getenv("RAG_SESSION_DB") or os.path.join(DATA_DIR, "session.db")
+
+# 旧版本把会话库放在项目根目录，第一次用新路径启动时自动搬过去，避免历史对话丢失。
+# 注意：必须在下面 makedirs 之前执行——否则新位置会先出现一个空库，旧数据就搬不动了。
+_LEGACY_SQLITE_PATH = os.path.join(BASE_DIR, "session.db")
+
+
+def _migrate_legacy_session_db():
+    """根目录存在旧会话库、且新位置还没有库时，把旧库移动过去（只做一次）"""
+    if os.path.abspath(_LEGACY_SQLITE_PATH) == os.path.abspath(SQLITE_DB_PATH):
+        return False
+    if not os.path.exists(_LEGACY_SQLITE_PATH) or os.path.exists(SQLITE_DB_PATH):
+        return False
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(SQLITE_DB_PATH)), exist_ok=True)
+        os.replace(_LEGACY_SQLITE_PATH, SQLITE_DB_PATH)
+        return True
+    except OSError:
+        # 跨盘或权限问题导致搬不动时不影响启动，只是历史对话不会带过来
+        return False
+
+
+MIGRATED_LEGACY_SESSION_DB = _migrate_legacy_session_db()
 
 # 自动创建目录
 os.makedirs(CHROMA_PERSIST_DIR, exist_ok=True)
+os.makedirs(os.path.dirname(os.path.abspath(SQLITE_DB_PATH)), exist_ok=True)
 
 # ---------------- 向量库配置 ----------------
 embedding_func = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
@@ -39,12 +68,23 @@ def init_session_db():
 
 init_session_db()
 
-# 统一获取向量库实例，全局复用
+# 统一获取向量库实例
+# 关键：必须在模块级构造一次并复用，不能每个请求都 new 一个。
+#   chromadb 内部有一张按 persist path 索引的全局客户端表
+#   (chromadb/api/shared_system_client.py)，并发创建同一路径的客户端会命中
+#   "先查后建"竞态，抛 KeyError: '<chroma路径>'。改造前所有请求都跑在事件循环
+#   线程里、天然串行，该竞态被掩盖；接口改由线程池执行后才暴露。
+#   顺带也省掉了每个请求新建客户端的开销（实测 /doc/list 约 690ms 中的大部分）。
+_vector_db = Chroma(
+    persist_directory=CHROMA_PERSIST_DIR,
+    embedding_function=embedding_func,
+)
+
+
 def get_vector_db() -> Chroma:
-    return Chroma(
-        persist_directory=CHROMA_PERSIST_DIR,
-        embedding_function=embedding_func
-    )
+    """返回全局复用的向量库实例"""
+    return _vector_db
+
 
 def filter_reference_text(text: str) -> str:
     """过滤参考文献片段，剔除 [数字]. 开头的参考文献行"""
@@ -60,7 +100,10 @@ def filter_reference_text(text: str) -> str:
 
 # ---------------- PDF处理工具 ----------------
 def process_pdf_to_vector(pdf_file_path: str):
-    """读取PDF → 分块 → 过滤参考文献 → 写入Chroma向量库，携带元数据doc_name、doc_unique_id"""
+    """读取PDF → 分块 → 过滤参考文献 → 写入Chroma向量库，携带元数据doc_name、doc_unique_id
+
+    :return: (doc_unique_id, 切片数量)
+    """
     loader = PyPDFLoader(pdf_file_path)
     docs = loader.load()
     split_docs = text_splitter.split_documents(docs)
@@ -71,9 +114,14 @@ def process_pdf_to_vector(pdf_file_path: str):
         doc.page_content = filter_reference_text(doc.page_content)
         doc.metadata["doc_name"] = filename
         doc.metadata["doc_unique_id"] = doc_unique_id
+    # 没有任何切片时直接返回：把空列表交给 Chroma.add_documents 会抛
+    # "Expected Embeddings to be non-empty list"，掩盖真实原因（PDF无可用文本）
+    if not split_docs:
+        return doc_unique_id, 0
     vector_db = get_vector_db()
     vector_db.add_documents(split_docs)
-    return True
+    # 返回唯一ID与切片数：调用方据此判断"PDF解析出来是空的"
+    return doc_unique_id, len(split_docs)
 
 def search_vector_db(query: str, k: int = 3):
     """向量检索，返回文档片段列表"""

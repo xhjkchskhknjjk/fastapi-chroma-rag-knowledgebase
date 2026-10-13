@@ -4,8 +4,9 @@
 # 上传的PDF文件
 uploads/
 
-# chroma向量数据库文件夹
+# 向量库与本地数据（含会话库）
 chroma_db/
+data/
 
 # python缓存
 __pycache__/
@@ -17,11 +18,12 @@ venv/
 
 # 日志
 *.log
+logs/*
 
-# docker临时
-.dockerignore
+# 注意：.dockerignore 是构建配置，必须纳入版本管理，不能忽略。
+# 一旦仓库里缺少它，clone 后的首次 docker build 会把 venv/ 和 .env 一起打进镜像。
 
 meta.json
 
-logs/*
+# 旧的会话库位置（已迁移到 data/session.db），保留忽略以防回滚残留
 session.db

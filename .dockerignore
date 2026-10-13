@@ -1,12 +1,35 @@
+# 依赖与虚拟环境：venv 若被打进镜像，Windows 版依赖会污染容器内的 Linux 环境
 venv/
-.env
-uploads/
-chroma_db/
-.git/
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-session.db
+
+# 密钥：绝不能进镜像（运行时用 --env-file 注入）
+.env
+
+# 运行期数据：容器里由数据卷提供
+uploads/
+chroma_db/
+data/
+logs/
 *.db
-*.db‑journal
+*.db-journal
+
+# 版本控制与本地工具
+.git/
+.gitignore
+
+# 测试与本地脚本
+test_*.py
+_testconfig.py
+_patch_*.py
+_diag_*.py
+_verify_*.py
+_e2e_*.py
+_*.txt
+
+# 文档与编辑器
+*.md
+.vscode/
+.idea/
