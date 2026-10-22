@@ -27,3 +27,7 @@ meta.json
 
 # 旧的会话库位置（已迁移到 data/session.db），保留忽略以防回滚残留
 session.db
+
+# 本地排查用的一次性脚本，不作为项目内容提交
+_*.py
+_*.txt
