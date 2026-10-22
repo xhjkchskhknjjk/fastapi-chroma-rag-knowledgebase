@@ -2,6 +2,10 @@ import hmac
 import ipaddress
 import os
 
+# 必须最先导入：在 transformers / sentence_transformers 被导入之前设置 HF 离线变量，
+# 否则加载 embedding 模型时会向 huggingface.co 发请求并在超时后重试，导致启动卡数分钟
+import model_config  # noqa: F401
+
 from dotenv import load_dotenv
 from fastapi import HTTPException, Request
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -41,6 +45,106 @@ if DEV_NO_TOKEN:
         "APP_ENV=dev 且未配置 API_ACCESS_TOKEN：仅本机回环地址(127.0.0.1/::1)免鉴权，"
         "其他来源一律返回401；对外提供服务前请配置 API_ACCESS_TOKEN 并设置 APP_ENV=prod"
     )
+
+
+# ----------------------大模型与业务配置----------------------
+# 这些项必须真正从环境变量读取：此前 DEEPSEEK_URL / DEEPSEEK_MODEL 在代码里写死，
+# 导致 .env 中配置了也不生效，属于"看起来可配、实际不可配"的陷阱。
+
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
+DEEPSEEK_URL = os.getenv(
+    "DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions"
+).strip()
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat").strip()
+
+# 生成参数：温度与超时此前分别硬编码为 0.1 与 60 秒
+try:
+    DEEPSEEK_TEMPERATURE = float(os.getenv("DEEPSEEK_TEMPERATURE", "0.1"))
+except ValueError:
+    DEEPSEEK_TEMPERATURE = 0.1
+try:
+    DEEPSEEK_TIMEOUT = int(os.getenv("DEEPSEEK_TIMEOUT", "60"))
+except ValueError:
+    DEEPSEEK_TIMEOUT = 60
+
+# 上传目录：此前写死 "./uploads"，导致容器内数据卷必须挂在固定路径才生效
+UPLOAD_DIR = os.getenv("RAG_UPLOAD_DIR", "./uploads").strip() or "./uploads"
+
+# 单文件大小上限（MB），缺省 50
+try:
+    MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "50"))
+    if MAX_UPLOAD_MB <= 0:
+        MAX_UPLOAD_MB = 50
+except ValueError:
+    MAX_UPLOAD_MB = 50
+
+# 同时执行解析入库的任务数上限，缺省 4
+try:
+    MAX_CONCURRENT_INGEST = max(1, int(os.getenv("MAX_CONCURRENT_INGEST", "4")))
+except ValueError:
+    MAX_CONCURRENT_INGEST = 4
+
+# 等待入库槽位的最长秒数，缺省 60，超时返回 503
+try:
+    INGEST_WAIT_TIMEOUT = float(os.getenv("RAG_INGEST_WAIT_TIMEOUT", "60"))
+    if INGEST_WAIT_TIMEOUT <= 0:
+        INGEST_WAIT_TIMEOUT = 60.0
+except ValueError:
+    INGEST_WAIT_TIMEOUT = 60.0
+
+# OpenAPI 展示用的版本号：此前写死 "1.0.0"，现由环境变量提供
+APP_VERSION = os.getenv("RAG_APP_VERSION", "1.0.0").strip() or "1.0.0"
+
+SYSTEM_PROMPT = os.getenv(
+    "SYSTEM_PROMPT",
+    "你是知识库问答助手，请严格依据提供的参考文档回答问题，如果文档没有相关信息如实告知用户。",
+).strip()
+
+# 启动期配置校验：把"运行时才发现"的配置错误提前到启动时暴露
+CONFIG_STARTUP_PROBLEMS = []
+CONFIG_STARTUP_WARNINGS = []
+
+if not DEEPSEEK_API_KEY:
+    msg = (
+        "未配置 DEEPSEEK_API_KEY：/qa/chat 的所有请求都会失败"
+        "（大模型返回401）。请在 .env 或系统环境变量中配置"
+    )
+    # 生产环境缺大模型密钥直接拒绝启动：核心功能完全不可用
+    if IS_PROD:
+        raise RuntimeError(msg)
+    CONFIG_STARTUP_PROBLEMS.append(msg)
+
+if not DEEPSEEK_URL.startswith(("http://", "https://")):
+    msg = f"DEEPSEEK_URL 不是合法的 http(s) 地址: {DEEPSEEK_URL!r}"
+    if IS_PROD:
+        raise RuntimeError(msg)
+    CONFIG_STARTUP_WARNINGS.append(msg)
+
+if not DEEPSEEK_MODEL:
+    CONFIG_STARTUP_WARNINGS.append("DEEPSEEK_MODEL 为空，将导致大模型调用失败")
+
+if DEEPSEEK_TIMEOUT <= 0:
+    CONFIG_STARTUP_WARNINGS.append(
+        f"DEEPSEEK_TIMEOUT={DEEPSEEK_TIMEOUT} 不是正整数，已回退为60"
+    )
+    DEEPSEEK_TIMEOUT = 60
+
+if not SYSTEM_PROMPT:
+    CONFIG_STARTUP_WARNINGS.append("SYSTEM_PROMPT 为空，将不带系统提示词直接提问")
+
+# 供启动日志展示：让"实际生效的配置"在日志里可见，而不是靠猜
+EFFECTIVE_CONFIG_SUMMARY = {
+    "APP_ENV": APP_ENV,
+    "DEEPSEEK_URL": DEEPSEEK_URL,
+    "DEEPSEEK_MODEL": DEEPSEEK_MODEL,
+    "DEEPSEEK_TEMPERATURE": DEEPSEEK_TEMPERATURE,
+    "DEEPSEEK_TIMEOUT": DEEPSEEK_TIMEOUT,
+    "UPLOAD_DIR": UPLOAD_DIR,
+    "MAX_UPLOAD_MB": MAX_UPLOAD_MB,
+    "MAX_CONCURRENT_INGEST": MAX_CONCURRENT_INGEST,
+    "API_KEY_CONFIGURED": bool(DEEPSEEK_API_KEY),  # 只标识是否配置，不输出密钥本身
+    "API_ACCESS_TOKEN_CONFIGURED": bool(EXPECTED_TOKEN),
+}
 
 
 def is_loopback_request(request: Request) -> bool:

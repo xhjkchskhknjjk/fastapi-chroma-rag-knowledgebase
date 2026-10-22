@@ -23,18 +23,31 @@ from security import (
     is_loopback_request,
     resolve_client_ip,
     AUTH_STARTUP_WARNING,
+    # 配置项统一从 security 引入，避免散落在各处写死
+    DEEPSEEK_API_KEY,
+    DEEPSEEK_URL,
+    DEEPSEEK_MODEL,
+    DEEPSEEK_TEMPERATURE,
+    DEEPSEEK_TIMEOUT,
+    SYSTEM_PROMPT,
+    UPLOAD_DIR,
+    MAX_UPLOAD_MB,
+    MAX_CONCURRENT_INGEST,
+    INGEST_WAIT_TIMEOUT,
+    APP_VERSION,
+    CONFIG_STARTUP_PROBLEMS,
+    CONFIG_STARTUP_WARNINGS,
+    EFFECTIVE_CONFIG_SUMMARY,
 )
 from slowapi.errors import RateLimitExceeded
 from starlette.concurrency import run_in_threadpool
 import threading
 import time
 
-# 加载环境变量：本地开发读取.env；docker环境依靠系统环境变量，找不到文件不会报错
-# 注意：security.py在导入时已自行加载一次，保证APP_ENV与API_ACCESS_TOKEN在启动校验前可读
+# 环境变量：本地开发读取.env；docker环境依靠系统环境变量，找不到文件不会报错
+# 注意：security.py 在导入时已自行加载 .env 并完成配置解析与启动期校验，
+# 这里不再重复读取，重复定义会导致两处值可能不一致。
 load_dotenv()
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "你是知识库问答助手，请严格依据提供的参考文档回答问题，如果文档没有相关信息如实告知用户。")
-APP_DESCRIPTION_VERSION = "1.0.0"
 
 # 实例化app对象
 app = FastAPI(title="RAG知识库服务")
@@ -48,13 +61,23 @@ if AUTH_STARTUP_WARNING:
 else:
     logger.info("鉴权已启用：除文档接口外，所有请求需携带请求头 X-Access-Token")
 
+# 配置问题与生效配置打印：让"配置到底有没有生效"在日志里一目了然，
+# 避免再次出现 .env 里改了、代码里却没读取的情况
+for _problem in CONFIG_STARTUP_PROBLEMS:
+    logger.error(f"配置问题：{_problem}")
+for _warning in CONFIG_STARTUP_WARNINGS:
+    logger.warning(f"配置警告：{_warning}")
+logger.info(
+    "生效配置：" + ", ".join(f"{k}={v}" for k, v in EFFECTIVE_CONFIG_SUMMARY.items())
+)
+
 # ==========OpenAPI文档增加token输入框（swagger右上角🔐按钮）==========
 def custom_openapi():
     if app.openapi_schema:
         return app.openapi_schema
     openapi_schema = get_openapi(
         title="RAG知识库服务",
-        version=APP_DESCRIPTION_VERSION,
+        version=APP_VERSION,
         description=(
             "RAG知识库问答服务。\n\n"
             "**鉴权**：除 `/docs`、`/openapi.json` 外，所有接口需在请求头携带 `X-Access-Token`，"
@@ -132,27 +155,18 @@ async def global_exception_handler(request: Request, exc: Exception):
         }
     )
 
-UPLOAD_DIR = "./uploads"
+# UPLOAD_DIR 来自配置区（RAG_UPLOAD_DIR），默认 ./uploads
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# 单文件大小上限，可用环境变量覆盖，默认50MB
-try:
-    MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "50"))
-except ValueError:
-    MAX_UPLOAD_MB = 50
+# 大小/并发等上限来自 security 配置区（MAX_UPLOAD_MB、MAX_CONCURRENT_INGEST、
+# INGEST_WAIT_TIMEOUT），此处只做派生值与运行时对象
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 # 读请求体的分块大小；此循环运行在事件循环里，块取大一些以减少 await 次数
 UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024
 
-# 同时执行"解析入库"的上限。PDF解析+embedding是CPU密集操作，
-# 并发过高会把默认线程池(40)占满，连带让 /doc/list 等接口一起排队
-try:
-    MAX_CONCURRENT_INGEST = max(1, int(os.getenv("MAX_CONCURRENT_INGEST", "4")))
-except ValueError:
-    MAX_CONCURRENT_INGEST = 4
+# PDF解析+embedding是CPU密集操作，并发过高会把默认线程池(40)占满，
+# 连带让 /doc/list 等接口一起排队，因此用信号量限制同时入库数量
 INGEST_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_INGEST)
-# 等待入库槽位的最长秒数，超时返回503而不是无限占用请求
-INGEST_WAIT_TIMEOUT = float(os.getenv("INGEST_WAIT_TIMEOUT", "60"))
 
 # 同一个embedding模型会被多个线程并发调用：实测 torch 2.13 CPU 版并发4次调用正常
 # （intra-op 16线程，总耗时与单次相同），故模型侧无需再加锁
@@ -163,26 +177,30 @@ class ChatRequest(BaseModel):
     k: int = Field(default=3, ge=1, le=10, description="检索片段数量1~10")
     session_id: str = Field(default="default", description="会话ID区分不同用户")
 
-# Deepseek配置
-DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
-
+# Deepseek 配置：全部来自 security 的配置区（读取环境变量），此处不再写死
 def call_llm(messages: list):
     """
     调用大模型API
     :param messages: openai格式消息数组 [{"role":"system","content":"..."}, ...]
     :return: (content:str|None, err_msg:str)
     """
+    # 前置守卫：没有密钥时不要走完检索链路再让大模型返回401，
+    # 直接给出可运维排查的错误（否则日志里只会看到一串鉴权失败）
+    if not DEEPSEEK_API_KEY:
+        err = "服务端未配置 DEEPSEEK_API_KEY，无法调用大模型"
+        logger.error(err)
+        return None, err
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json"
     }
     payload = {
-        "model": "deepseek-chat",
+        "model": DEEPSEEK_MODEL,
         "messages": messages,
-        "temperature": 0.1
+        "temperature": DEEPSEEK_TEMPERATURE,
     }
     try:
-        resp = requests.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=60)
+        resp = requests.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=DEEPSEEK_TIMEOUT)
         res_json = resp.json()
         if resp.status_code != 200:
             err = f"大模型http状态码异常:{resp.status_code}, detail:{res_json.get('error','')}"
